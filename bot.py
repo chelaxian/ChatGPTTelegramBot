@@ -4,7 +4,7 @@ sys.dont_write_bytecode = True
 import logging
 import traceback
 import utils.decorators as decorators
-import urllib.parse
+
 from md2tgmd.src.md2tgmd import escape, split_code, replace_all
 from ModelMerge.src.ModelMerge.utils.prompt import translator_en2zh_prompt, translator_prompt
 from ModelMerge.src.ModelMerge.utils.scripts import Document_extract, claude_replace, get_image_message
@@ -85,6 +85,9 @@ async def command_bot(update, context, language=None, prompt=translator_prompt, 
     stop_event.clear()
     message, rawtext, image_url, chatid, messageid, reply_to_message_text, update_message, message_thread_id, convo_id, file_url, reply_to_message_file_content, voice_text = await GetMesageInfo(update, context)
 
+    # Проверка на наличие голосового сообщения
+    is_voice_message = update_message and update_message.voice
+    
     if has_command == False or len(context.args) > 0:
         if has_command:
             message = ' '.join(context.args)
@@ -99,6 +102,24 @@ async def command_bot(update, context, language=None, prompt=translator_prompt, 
             message = prompt + message
         if message == None:
             message = voice_text
+            # Если сообщение получено из голосового ввода, явно указываем это в логах для отладки
+            if voice_text:
+                logger.info(f"Processing voice message: {voice_text}")
+                # Получаем модель для отображения в заголовке
+                engine = Users.get_config(convo_id, "engine")
+                # Для голосовых сообщений добавим специальную пометку, чтобы отслеживать их обработку
+                title = f"`🎤️ {engine}`\n\n"
+                # Проверяем, не содержит ли распознанный текст сообщений об ошибке
+                if voice_text.startswith("Не удалось") or "ошибка" in voice_text.lower() or "error" in voice_text.lower():
+                    logger.warning(f"Voice recognition error detected in message: {voice_text}")
+                    await context.bot.send_message(
+                        chat_id=chatid,
+                        message_thread_id=message_thread_id,
+                        text=escape(f"❌ Ошибка распознавания голосового сообщения: {voice_text}"),
+                        parse_mode='MarkdownV2',
+                        reply_to_message_id=messageid,
+                    )
+                    return
         # print("message", message)
         if message and len(message) == 1 and is_emoji(message):
             return
@@ -227,9 +248,7 @@ async def is_bot_blocked(bot, user_id: int) -> bool:
         # 处理其他可能的错误
         return False  # 如果是其他错误，我们假设机器人未被封禁
 
-
-
-async def getChatGPT(update_message, context, title, robot, message, chatid, messageid, convo_id, message_thread_id, pass_history=0, api_key=None, api_url=None, engine=None):
+async def getChatGPT(update_message, context, title, robot, message, chatid, messageid, convo_id, message_thread_id, pass_history=0, api_key=None, api_url=None, engine = None):
     lastresult = title
     text = message
     result = ""
@@ -238,6 +257,7 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
     time_out = 600
     image_has_send = 0
     model_name = engine
+    is_voice_message = title and "🎤️" in title
     language = Users.get_config(convo_id, "language")
     if "claude" in model_name:
         system_prompt = Users.get_config(convo_id, "claude_systemprompt")
@@ -253,6 +273,13 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
     if "gemini" in model_name and (GOOGLE_AI_API_KEY or (VERTEX_CLIENT_EMAIL and VERTEX_PRIVATE_KEY and VERTEX_PROJECT_ID)):
         Frequency_Modification = 1
 
+    if is_voice_message:
+        logger.info(f"Processing voice message response with model {model_name}")
+        # Для голосовых сообщений используем более короткий интервал модификации сообщения
+        Frequency_Modification = 10
+        # Важно: логируем для отладки состояние запроса
+        logger.info(f"Voice message query: '{text}' will be processed through API")
+        
     if not await is_bot_blocked(context.bot, chatid):
         answer_messageid = (await context.bot.send_message(
             chat_id=chatid,
@@ -265,9 +292,48 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
         return
 
     try:
-        async for data in robot.ask_stream_async(text, convo_id=convo_id, pass_history=pass_history,
-                                                  model=model_name, language=language, api_url=api_url,
-                                                  api_key=api_key, system_prompt=system_prompt, plugins=plugins):
+        # Для голосовых сообщений используем режим без потоковой обработки, чтобы избежать проблем
+        if is_voice_message:
+            try:
+                logger.info(f"Using non-streaming mode for voice message with model {model_name}")
+                # Запрашиваем полный ответ без использования потоковой обработки
+                full_response = await robot.ask_async(text, convo_id=convo_id, pass_history=pass_history, 
+                                                    model=model_name, language=language, api_url=api_url, 
+                                                    api_key=api_key, system_prompt=system_prompt, plugins=plugins)
+                
+                logger.info(f"Received full response for voice message: {full_response[:200]}...")
+                result = full_response
+                # !!! Важное изменение: не добавляем title к результату сразу
+                tmpresult = result
+                logger.info(f"Displaying response for voice message. Title: '{title}', Result: '{result[:200]}...'")
+                
+                # Обновляем сообщение с полным ответом, добавляя title только перед отправкой
+                try:
+                    display_text = title + tmpresult
+                    await context.bot.edit_message_text(
+                        chat_id=chatid, 
+                        message_id=answer_messageid,
+                        text=escape(display_text, italic=False),
+                        parse_mode='MarkdownV2',
+                        disable_web_page_preview=True
+                    )
+                    lastresult = escape(display_text, italic=False)
+                except Exception as e:
+                    logger.error(f"Error updating voice message response: {str(e)}")
+                    if "parse entities" in str(e):
+                        await context.bot.edit_message_text(
+                            chat_id=chatid,
+                            message_id=answer_messageid,
+                            text=title + tmpresult,
+                            disable_web_page_preview=True
+                        )
+                return
+            except Exception as voice_e:
+                logger.error(f"Error in voice message non-streaming mode: {str(voice_e)}")
+                # Если произошла ошибка, продолжаем со стандартным потоковым режимом
+                
+        # print("text", text)
+        async for data in robot.ask_stream_async(text, convo_id=convo_id, pass_history=pass_history, model=model_name, language=language, api_url=api_url, api_key=api_key, system_prompt=system_prompt, plugins=plugins):
             if stop_event.is_set() and convo_id == target_convo_id and answer_messageid < reset_mess_id:
                 return
             if "message_search_stage_" not in data:
@@ -277,21 +343,27 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                 tmpresult = result + "`"
             if sum([line.strip().startswith("```") for line in result.split('\n')]) % 2 != 0:
                 tmpresult = tmpresult + "\n```"
-            tmpresult = title + tmpresult
+            
+            # Важное изменение: не добавляем title к промежуточному результату
+            # tmpresult = title + tmpresult
+            display_result = title + tmpresult
+            
             if "claude" in model_name:
-                tmpresult = claude_replace(tmpresult)
+                display_result = claude_replace(display_result)
             if "message_search_stage_" in data:
-                tmpresult = strings[data][get_current_lang(convo_id)]
+                display_result = strings[data][get_current_lang(convo_id)]
             history = robot.conversation[convo_id]
             if safe_get(history, -2, "tool_calls", 0, 'function', 'name') == "generate_image" and not image_has_send and safe_get(history, -1, 'content'):
                 await context.bot.send_photo(chat_id=chatid, photo=history[-1]['content'], reply_to_message_id=messageid)
                 image_has_send = 1
-            modifytime += 1
+            modifytime = modifytime + 1
 
             split_len = 3500
-            if len(tmpresult) > split_len and Users.get_config(convo_id, "LONG_TEXT_SPLIT"):
+            if len(display_result) > split_len and Users.get_config(convo_id, "LONG_TEXT_SPLIT"):
                 Frequency_Modification = 40
-                replace_text = replace_all(tmpresult, r"(```[\D\d\s]+?```)", split_code)
+
+                # print("tmpresult", tmpresult)
+                replace_text = replace_all(display_result, r"(```[\D\d\s]+?```)", split_code)
                 if "@|@|@|@" in replace_text:
                     print("@|@|@|@", replace_text)
                     split_messages = replace_text.split("@|@|@|@")
@@ -321,6 +393,7 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                                 if sub_index % 2 == 0:
                                     item_split_new.append(sub_item)
                             split_messages_new.extend(item_split_new)
+
                     split_index = 0
                     for index, _ in enumerate(split_messages_new):
                         if len("".join(split_messages_new[:index])) < split_len:
@@ -328,20 +401,27 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                             continue
                         else:
                             break
+                    # print("split_messages_new", split_messages_new)
                     send_split_message = ''.join(split_messages_new[:split_index])
                     matches = re.findall(r"(```.*?\n)", send_split_message)
                     if len(matches) % 2 != 0:
                         send_split_message = send_split_message + "```\n"
+                    # print("send_split_message", send_split_message)
                     tmp = ''.join(split_messages_new[split_index:])
                     if tmp.strip().endswith("```"):
                         result = tmp[:-4]
                     else:
                         result = tmp
+                    # print("result", result)
                     matches = re.findall(r"(```.*?\n)", send_split_message)
                     result_matches = re.findall(r"(```.*?\n)", result)
+                    # print("matches", matches)
+                    # print("result_matches", result_matches)
                     if len(result_matches) > 0 and result_matches[0].startswith("```\n") and len(result_matches) >= 2:
                         result = matches[-2] + result
-                title = ""
+                    # print("result", result)
+
+                display_result = ""
                 if lastresult != escape(send_split_message, italic=False):
                     try:
                         await context.bot.edit_message_text(
@@ -379,22 +459,26 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
                     reply_to_message_id=messageid,
                 )).message_id
 
-            now_result = escape(tmpresult, italic=False)
+            now_result = escape(display_result, italic=False)
             if now_result and (modifytime % Frequency_Modification == 0 and lastresult != now_result) or "message_search_stage_" in data:
                 try:
                     await context.bot.edit_message_text(
-                        chat_id=chatid,
+                        chat_id=chatid, 
                         message_id=answer_messageid,
                         text=now_result,
                         parse_mode='MarkdownV2',
                         disable_web_page_preview=True,
-                        read_timeout=time_out,
-                        write_timeout=time_out,
-                        pool_timeout=time_out,
+                        read_timeout=time_out, 
+                        write_timeout=time_out, 
+                        pool_timeout=time_out, 
                         connect_timeout=time_out
                     )
                     lastresult = now_result
+                    modifytime = modifytime + 1
                 except Exception as e:
+                    # print('\033[31m')
+                    # print("error: edit_message_text")
+                    # print('\033[0m')
                     continue
     except Exception as e:
         print('\033[31m')
@@ -406,38 +490,12 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
         if api_key:
             robot.reset(convo_id=convo_id, system_prompt=systemprompt)
         if "parse entities" in str(e):
-            await context.bot.edit_message_text(
-                chat_id=chatid,
-                message_id=answer_messageid,
-                text=tmpresult,
-                disable_web_page_preview=True,
-                read_timeout=time_out,
-                write_timeout=time_out,
-                pool_timeout=time_out,
-                connect_timeout=time_out
-            )
+            await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
         else:
             tmpresult = f"{tmpresult}\n\n`{e}`"
     print(tmpresult)
 
-    # --- Block 1: Replace markdown links containing filesystem.site with proxy links ---
-    def replace_md_fs(match):
-        original_url = match.group(2)
-        encoded = urllib.parse.quote(original_url, safe='')
-        proxy = f"https://wsrv.nl/?url={encoded}&output=jpg"
-        return f"![{proxy}]({proxy})"
-    tmpresult = re.sub(r'!\[([^\]]*filesystem\.site[^\]]*)\]\(([^\)]+filesystem\.site[^\)]*)\)', replace_md_fs, tmpresult, flags=re.IGNORECASE)
-
-    # --- Block 2: Replace remaining links with filesystem.site with proxy links ---
-    def replace_fs_link(match):
-        url = match.group(0)
-        if not re.search(r'\.(?:webp|jpg|jpeg|png|gif)$', url, re.IGNORECASE):
-            encoded_url = urllib.parse.quote(url, safe='')
-            return f"https://wsrv.nl/?url={encoded_url}&output=jpg"
-        return url
-    tmpresult = re.sub(r'https?://filesystem\.site/[^\s<>\"()]+', replace_fs_link, tmpresult, flags=re.IGNORECASE)
-
-    # --- Send image if not sent already ---
+    # 添加图片URL检测和发送
     if image_has_send == 0:
         image_extensions = r'(https?://[^\s<>\"()]+(?:\.(?:webp|jpg|jpeg|png|gif)|/image)[^\s<>\"()]*)'
         image_urls = re.findall(image_extensions, tmpresult, re.IGNORECASE)
@@ -461,28 +519,20 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
         elif now_result:
             try:
                 await context.bot.edit_message_text(
-                    chat_id=chatid,
+                    chat_id=chatid, 
                     message_id=answer_messageid,
                     text=now_result,
                     parse_mode='MarkdownV2',
                     disable_web_page_preview=True,
-                    read_timeout=time_out,
-                    write_timeout=time_out,
-                    pool_timeout=time_out,
+                    read_timeout=time_out, 
+                    write_timeout=time_out, 
+                    pool_timeout=time_out, 
                     connect_timeout=time_out
                 )
             except Exception as e:
                 if "parse entities" in str(e):
-                    await context.bot.edit_message_text(
-                        chat_id=chatid,
-                        message_id=answer_messageid,
-                        text=tmpresult,
-                        disable_web_page_preview=True,
-                        read_timeout=time_out,
-                        write_timeout=time_out,
-                        pool_timeout=time_out,
-                        connect_timeout=time_out
-                    )
+                    await context.bot.edit_message_text(chat_id=chatid, message_id=answer_messageid, text=tmpresult, disable_web_page_preview=True, read_timeout=time_out, write_timeout=time_out, pool_timeout=time_out, connect_timeout=time_out)
+
     if Users.get_config(convo_id, "FOLLOW_UP") and tmpresult.strip():
         if title != "":
             info = "\n\n".join(tmpresult.split("\n\n")[1:])
@@ -495,23 +545,15 @@ async def getChatGPT(update_message, context, title, robot, message, chatid, mes
             "{}"
             "</infomation>"
         ).format(info)
-        result = (await config.SummaryBot.ask_async(prompt, convo_id=convo_id, pass_history=0,
-                                                      api_url=api_url, api_key=api_key)).split('\n')
+        result = (await config.SummaryBot.ask_async(prompt, convo_id=convo_id, pass_history=0, api_url=api_url, api_key=api_key)).split('\n')
         keyboard = []
         result = [i for i in result if i.strip() and len(i) > 5]
         print(result)
         for ques in result:
             keyboard.append([KeyboardButton(ques)])
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-        await update_message.reply_text(
-            text=escape(tmpresult, italic=False),
-            parse_mode='MarkdownV2',
-            reply_to_message_id=messageid,
-            reply_markup=reply_markup
-        )
+        await update_message.reply_text(text=escape(tmpresult, italic=False), parse_mode='MarkdownV2', reply_to_message_id=messageid, reply_markup=reply_markup)
         await context.bot.delete_message(chat_id=chatid, message_id=answer_messageid)
-
-
 
 @decorators.AdminAuthorization
 @decorators.GroupAuthorization
